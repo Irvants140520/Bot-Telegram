@@ -1,0 +1,237 @@
+import logging
+import re
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    CallbackContext,
+)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = "8482004591:AAHeUYas0aihrMkHkhlyTWGs8kjGxGamC5g"
+SOURCE_GROUP_ID = -1003278868234
+TARGET_CHANNEL_ID = -1002952364104
+
+# Penyimpanan sementara risk per user (bisa ganti ke DB)
+user_risk = {}
+
+# === FUNGSI UTILITAS ===
+def get_tick_size(price):
+    if price < 200:
+        return 1
+    elif price < 500:
+        return 2
+    elif price < 2000:
+        return 5
+    elif price < 5000:
+        return 10
+    else:
+        return 25
+
+def round_to_tick(price, tick_size):
+    return round(price / tick_size) * tick_size
+
+def calculate_sl(price):
+    sl = price * 0.97
+    tick = get_tick_size(sl)
+    return round_to_tick(sl, tick)
+
+def calculate_tp(price):
+    tp_min = price * 1.03
+    tp_max = price * 1.05
+    tick_min = get_tick_size(tp_min)
+    tick_max = get_tick_size(tp_max)
+    return round_to_tick(tp_min, tick_min), round_to_tick(tp_max, tick_max)
+
+def shares_to_lot(shares: int) -> str:
+    lot = shares // 100
+    remainder = shares % 100
+    if remainder == 0:
+        return f"{lot} lot"
+    return f"{lot} lot + {remainder} lembar"
+
+# === PARSE & FORMAT ALERT ===
+def parse_message(text):
+    try:
+        date_match = re.search(r'\[(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', text)
+        if not date_match:
+            return None
+        date_str = date_match.group(1)
+        time_str = date_match.group(2)
+        date_obj = datetime.strptime(date_str, "%d/%m/%Y")
+        months_id = {
+            1: "Januari", 2: "Februari", 3: "Maret", 4: "April",
+            5: "Mei", 6: "Juni", 7: "Juli", 8: "Agustus",
+            9: "September", 10: "Oktober", 11: "November", 12: "Desember"
+        }
+        formatted_date = f"{date_obj.day} {months_id[date_obj.month]} {date_obj.year}"
+        new_match = re.search(r'New:\s*(.+?)(?:\n|$)', text)
+        if not new_match:
+            return None
+        new_data = new_match.group(1).strip()
+        stock_patterns = re.findall(r'/([A-Z]+):(\d+)', new_data)
+        stocks_data = []
+        for stock_name, price_str in stock_patterns:
+            price = int(price_str)
+            sl = calculate_sl(price)
+            tp_min, tp_max = calculate_tp(price)
+            stocks_data.append({
+                'name': stock_name,
+                'price': price,
+                'sl': sl,
+                'tp_min': tp_min,
+                'tp_max': tp_max
+            })
+        if not stocks_data:
+            return None
+        return {
+            'time': time_str,
+            'date': formatted_date,
+            'stocks': stocks_data
+        }
+    except Exception as e:
+        logger.error(f"Error parsing message: {e}")
+        return None
+
+def format_message(parsed_data):
+    messages = []
+    for stock in parsed_data['stocks']:
+        ticker = stock['name']
+        entry = stock['price']
+        deep_link = f"https://t.me/fractalscale_bot?start=calc_{ticker}_{entry}"
+        keyboard = [[InlineKeyboardButton("💰 Hitung Lot", url=deep_link)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = f"""
+📊 Stock Name : #{ticker}
+
+📌 Entry Buy : {entry}
+🛡 SL : {stock['sl']}
+💵 TP 1 : {stock['tp_min']}
+💰 TP 2 : {stock['tp_max']}
+
+{parsed_data['time']}
+{parsed_data['date']}
+
+📝 <a href="https://t.me/c/2952364104/5">Cara Menggunakan Alert</a>"""
+        messages.append((text, reply_markup))
+    return messages
+
+# === HANDLER ALERT ===
+async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != SOURCE_GROUP_ID:
+        return
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text
+    if "Formula-based alert" not in text:
+        return
+    parsed_data = parse_message(text)
+    if not parsed_data:
+        return
+    formatted_messages = format_message(parsed_data)
+    for msg, markup in formatted_messages:
+        await context.bot.send_message(
+            chat_id=TARGET_CHANNEL_ID,
+            text=msg,
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+
+# === HANDLER BOT PRIBADI ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+    if args and args[0].startswith("calc_"):
+        _, ticker, entry = args[0].split("_")
+        entry_price = int(entry)
+        context.user_data["ticker"] = ticker
+        context.user_data["entry"] = entry_price
+        await update.message.reply_html(
+            f"🧮 Kamu ingin hitung lot untuk <b>#{ticker}</b> di harga <b>{entry_price}</b>.\n\n"
+            "Silakan kirim besar <b>RISK per trade</b> kamu (dalam Rupiah).\n\n"
+            "Contoh: <code>1000000</code> \n\n"
+            "Risk Per Trade = Kamu siap rugi berapa banyak dalam satu kali trade? Jika trade ini gagal berapa kerugian yg siap kamu tanggung?"
+        )
+    else:
+        await update.message.reply_text(
+            "Halo! Kirim besarnya risk per trade kamu (Rp) untuk mulai menghitung lot."
+        )
+
+async def handle_risk_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        risk = int(update.message.text)
+        user = update.effective_user
+        user_risk[user.id] = risk
+
+        ticker = context.user_data.get("ticker")
+        entry = context.user_data.get("entry")
+        if not ticker or not entry:
+            await update.message.reply_text("⚠️ Tidak ada data saham. Klik tombol di channel dulu.")
+            return
+
+        sl = int(entry * 0.97)
+        tp1, tp2 = calculate_tp(entry)
+        sl_points = entry - sl
+        shares = int(risk / sl_points)
+        lot_str = shares_to_lot(shares)
+        total_value = shares * entry
+
+        loss_rp = shares * sl_points
+        profit_tp1_rp = shares * (tp1 - entry)
+        profit_tp2_rp = shares * (tp2 - entry)
+
+        keyboard = [[InlineKeyboardButton("🔄 Ganti Risk", callback_data="ganti_risk")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_html(
+            f"""
+🔢 <b>Risk Calculator – #{ticker}</b>
+
+💰 Risk per trade : Rp {risk:,}
+📌 Entry : {entry}
+🛡 Stop-Loss : {sl}
+📊 Jarak SL : {sl_points} poin
+
+🧮 Lot yang boleh dibeli:
+<pre>{lot_str} ({shares:,} lembar)</pre>
+
+💵 Total nilai lot: <b>Rp {total_value:,}</b>
+
+📉 <b>Loss jika kena SL:</b> Rp {loss_rp:,}
+📈 <b>Profit jika kena TP1:</b> Rp {profit_tp1_rp:,}
+🎯 <b>Profit jika kena TP2:</b> Rp {profit_tp2_rp:,}
+            """,
+            reply_markup=reply_markup
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Masukkan angka yang valid.")
+
+async def handle_ganti_risk(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("✏️ Kirim besar **risk per trade** baru (dalam Rupiah):")
+    
+# === MAIN ===
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Chat(SOURCE_GROUP_ID), forward_message))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_risk_input))
+    application.add_handler(CallbackQueryHandler(handle_ganti_risk, pattern="^ganti_risk$"))
+    logger.info("Bot dimulai...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
+    
